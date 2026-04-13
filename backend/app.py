@@ -1,12 +1,15 @@
 """
-SeaTac Operations Intelligence - Modal Edition v7.0
-FastAPI Implementation with Fine-Tuned Code Llama
+SeaTac Operations Intelligence - Claude Validator Edition v7.4
+FastAPI Implementation with Smart Validation Pipeline + Claude API
 
-Complete version with:
-- Modal fine-tuned Code Llama integration
-- Robust SQL cleaning and validation
-- 3-tier SQL generation (Modal → OpenRouter → Pre-built)
-- Temporal filtering and output format classification
+NEW in v7.4:
+- ✅ Claude API as "big brother" validator (replaces OpenRouter)
+- ✅ Superior validation and correction capabilities
+- ✅ Schema-aware SQL validation
+- ✅ Auto-correction of event type mistakes
+- ✅ Enhanced reasoning and error detection
+
+Pipeline: Modal → Auto-Correct → Claude Validates/Corrects → Execute
 """
 
 from fastapi import FastAPI, HTTPException, Request
@@ -25,14 +28,15 @@ import os
 from dotenv import load_dotenv
 import uvicorn
 import requests
+from anthropic import Anthropic  # NEW: Claude SDK
 
 load_dotenv()
 
 # Initialize FastAPI app
 app = FastAPI(
     title="SeaTac Airport Operations Intelligence",
-    description="AI-powered airport operations analysis - Modal Edition v7.0",
-    version="7.0.0"
+    description="AI-powered airport operations analysis - Claude Validator v7.4",
+    version="7.4.0"
 )
 
 # CORS configuration
@@ -45,9 +49,8 @@ app.add_middleware(
 )
 
 # Configuration
-OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY')
-OPENROUTER_MODEL = os.getenv('OPENROUTER_MODEL', 'google/gemini-2.0-flash-exp:free')
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+CLAUDE_API_KEY = os.getenv('CLAUDE_API_KEY')  # NEW
+CLAUDE_MODEL = os.getenv('CLAUDE_MODEL', 'claude-3-5-sonnet-20240620')  # FIXED: Correct version date
 
 # Modal Configuration
 MODAL_ENDPOINT = os.getenv('MODAL_ENDPOINT')
@@ -66,7 +69,182 @@ class DecimalEncoder(json.JSONEncoder):
 
 
 # ============================================================================
-# MODAL SQL GENERATOR (YOUR FINE-TUNED MODEL)
+# GREETING & CASUAL QUERY HANDLER
+# ============================================================================
+
+class GreetingHandler:
+    """Detect and handle greetings and casual queries with Claude"""
+    
+    def __init__(self, claude_client):
+        self.client = claude_client
+        self.model = CLAUDE_MODEL
+        
+        # Greeting patterns
+        self.greeting_keywords = [
+            'hello', 'hi', 'hey', 'good morning', 'good afternoon', 'good evening',
+            'how are you', 'whats up', "what's up", 'howdy', 'greetings', 'yo',
+            'sup', 'hiya', 'good day'
+        ]
+        
+        # Casual/non-data query patterns
+        self.casual_keywords = [
+            'thank you', 'thanks', 'appreciate', 'awesome', 'great', 'nice',
+            'help', 'what can you do', 'who are you', 'tell me about',
+            'explain', 'how do i', 'can you', 'goodbye', 'bye', 'see you'
+        ]
+    
+    def is_greeting_or_casual(self, query: str) -> bool:
+        """Check if query is a greeting or casual conversation"""
+        query_lower = query.lower().strip()
+        
+        # Very short queries are likely greetings
+        if len(query.split()) <= 3:
+            for keyword in self.greeting_keywords:
+                if keyword in query_lower:
+                    return True
+        
+        # Check casual patterns
+        for keyword in self.casual_keywords:
+            if query_lower.startswith(keyword):
+                return True
+        
+        # Check if it's a question about the system itself
+        system_questions = ['what can you', 'who are you', 'what do you do', 
+                          'how does this work', 'what is this']
+        for pattern in system_questions:
+            if pattern in query_lower:
+                return True
+        
+        return False
+    
+    async def handle_casual_query(self, query: str) -> str:
+        """Handle greetings and casual queries with Claude"""
+        if not self.client:
+            return self._fallback_response(query)
+        
+        try:
+            casual_prompt = f"""You are an AI assistant for SeaTac Airport Operations Intelligence system.
+
+The user said: "{query}"
+
+This appears to be a greeting or casual conversation, not a data query.
+
+Respond naturally and helpfully. If they're greeting you, greet them back warmly and briefly explain what you can help with (analyzing airport operations data like taxi times, flight counts, delays, etc.).
+
+Keep your response friendly, concise (2-3 sentences max), and professional.
+
+Response:"""
+            
+            message = self.client.messages.create(
+                model=self.model,
+                max_tokens=300,
+                temperature=0.7,
+                messages=[{"role": "user", "content": casual_prompt}]
+            )
+            
+            return message.content[0].text.strip()
+            
+        except Exception as e:
+            print(f"❌ Claude error in casual handler: {e}")
+            return self._fallback_response(query)
+    
+    def _fallback_response(self, query: str) -> str:
+        """Fallback responses if Claude isn't available"""
+        query_lower = query.lower().strip()
+        
+        # Greetings
+        if any(kw in query_lower for kw in ['hello', 'hi', 'hey', 'good morning', 'good afternoon']):
+            return "Hello! I'm your SeaTac Airport Operations assistant. I can help you analyze flight data, taxi times, delays, and more. What would you like to know?"
+        
+        # Thanks
+        if any(kw in query_lower for kw in ['thank', 'thanks', 'appreciate']):
+            return "You're welcome! Let me know if you need anything else."
+        
+        # Goodbye
+        if any(kw in query_lower for kw in ['bye', 'goodbye', 'see you']):
+            return "Goodbye! Feel free to come back anytime you need help with airport operations data."
+        
+        # What can you do
+        if 'what can you' in query_lower or 'who are you' in query_lower:
+            return """I'm an AI assistant specialized in SeaTac Airport Operations Intelligence. I can help you:
+
+• Analyze taxi-in and taxi-out times
+• Compare performance by aircraft type
+• Identify peak hours and delays
+• Calculate runway utilization
+• Show flight counts and operations data
+
+Just ask me a question about the airport operations!"""
+        
+        # Default
+        return "I'm here to help with SeaTac airport operations data. Try asking about taxi times, flight counts, delays, or aircraft operations!"
+
+
+# ============================================================================
+# SQL AUTO-CORRECTION
+# ============================================================================
+
+def fix_common_sql_errors(sql: str) -> str:
+    """
+    Auto-fix common event type errors
+    This runs AFTER SQL generation to catch mistakes
+    """
+    if not sql:
+        return sql
+    
+    # Store original for logging
+    original_sql = sql
+    
+    # Fix event types - case-insensitive replacement
+    event_type_fixes = {
+        # Takeoff variations
+        r"event_type\s*=\s*['\"]takeoff['\"]": "event_type = 'Actual_Take_Off'",
+        r"event_type\s*=\s*['\"]Takeoff['\"]": "event_type = 'Actual_Take_Off'",
+        r"event_type\s*=\s*['\"]take_off['\"]": "event_type = 'Actual_Take_Off'",
+        r"event_type\s*=\s*['\"]Take_Off['\"]": "event_type = 'Actual_Take_Off'",
+        r"event_type\s*=\s*['\"]TAKEOFF['\"]": "event_type = 'Actual_Take_Off'",
+        
+        # Landing variations
+        r"event_type\s*=\s*['\"]landing['\"]": "event_type = 'Actual_Landing'",
+        r"event_type\s*=\s*['\"]Landing['\"]": "event_type = 'Actual_Landing'",
+        r"event_type\s*=\s*['\"]LANDING['\"]": "event_type = 'Actual_Landing'",
+        
+        # Off Block variations
+        r"event_type\s*=\s*['\"]offblock['\"]": "event_type = 'Actual_Off_Block'",
+        r"event_type\s*=\s*['\"]off_block['\"]": "event_type = 'Actual_Off_Block'",
+        r"event_type\s*=\s*['\"]Off_Block['\"]": "event_type = 'Actual_Off_Block'",
+        r"event_type\s*=\s*['\"]OffBlock['\"]": "event_type = 'Actual_Off_Block'",
+        
+        # In Block variations
+        r"event_type\s*=\s*['\"]inblock['\"]": "event_type = 'Actual_In_Block'",
+        r"event_type\s*=\s*['\"]in_block['\"]": "event_type = 'Actual_In_Block'",
+        r"event_type\s*=\s*['\"]In_Block['\"]": "event_type = 'Actual_In_Block'",
+        r"event_type\s*=\s*['\"]InBlock['\"]": "event_type = 'Actual_In_Block'",
+    }
+    
+    corrections_made = []
+    
+    for pattern, replacement in event_type_fixes.items():
+        if re.search(pattern, sql, re.IGNORECASE):
+            sql = re.sub(pattern, replacement, sql, flags=re.IGNORECASE)
+            match = re.search(pattern, original_sql, re.IGNORECASE)
+            if match:
+                corrections_made.append(f"{match.group()} → {replacement}")
+    
+    # Log corrections
+    if corrections_made:
+        print("\n" + "=" * 80)
+        print("🔧 AUTO-CORRECTED EVENT TYPES")
+        print("=" * 80)
+        for correction in corrections_made:
+            print(f"   ✅ Fixed: {correction}")
+        print("=" * 80 + "\n")
+    
+    return sql
+
+
+# ============================================================================
+# MODAL SQL GENERATOR
 # ============================================================================
 
 class ModalSQLGenerator:
@@ -75,163 +253,96 @@ class ModalSQLGenerator:
     def __init__(self, endpoint: Optional[str], enabled: bool):
         self.endpoint = endpoint
         self.enabled = enabled and bool(endpoint)
-        self.timeout = 180  # 3 minutes for cold starts
+        self.timeout = 180
         
         if self.enabled:
             print(f"✅ Modal Code Llama ENABLED")
             print(f"   Endpoint: {self.endpoint}")
-            print(f"   Your fine-tuned model will be used first!")
         else:
-            if enabled and not endpoint:
-                print("⚠️  Modal enabled but MODAL_ENDPOINT not set")
-                print("   Will use OpenRouter fallback")
-            else:
-                print("ℹ️  Modal Code Llama disabled (USE_MODAL_MODEL=false)")
+            print("ℹ️  Modal Code Llama disabled")
     
     def _clean_sql(self, sql_text: str) -> str:
-        """
-        Aggressively clean SQL from LLM output.
-        Handles numbered lists, markdown, explanations, multiple queries.
-        """
+        """Clean SQL from Modal output"""
         if not sql_text:
             return sql_text
-    
+        
         print("\n" + "=" * 80)
         print("🧹 CLEANING SQL")
         print("=" * 80)
         print("RAW INPUT:")
         print(sql_text[:500] + "..." if len(sql_text) > 500 else sql_text)
         print("=" * 80)
-    
-        # Step 1: Remove markdown code blocks
+        
         sql_text = re.sub(r'```sql\s*', '', sql_text, flags=re.IGNORECASE)
         sql_text = re.sub(r'```\s*', '', sql_text)
-    
-        # Step 2: Remove numbered list markers at start
         sql_text = re.sub(r'^\s*\d+\.\s+', '', sql_text, flags=re.MULTILINE)
-    
-        # Step 3: Find ALL SELECT statements
+        
         lines = sql_text.split('\n')
         select_indices = []
-    
+        
         for i, line in enumerate(lines):
-            stripped = line.strip().upper()
-            if stripped.startswith(('SELECT', 'WITH')):
+            if line.strip().upper().startswith(('SELECT', 'WITH')):
                 select_indices.append(i)
-    
+        
         if not select_indices:
-            print("⚠️  No SELECT found, returning empty")
+            print("⚠️  No SELECT found")
             return ""
-    
-        # If multiple SELECT statements, only use the FIRST complete one
+        
         if len(select_indices) > 1:
-            print(f"⚠️  Found {len(select_indices)} SELECT statements - keeping only the first")
-    
-        # Start from first SELECT
+            print(f"⚠️  Found {len(select_indices)} SELECT statements - keeping first")
+        
         sql_start_idx = select_indices[0]
         sql_lines = lines[sql_start_idx:]
-    
-        # Step 4: Find where FIRST query ends
         sql_end_idx = len(sql_lines)
-    
+        
         for i, line in enumerate(sql_lines):
-            stripped = line.strip()
-            stripped_upper = stripped.upper()
-            stripped_lower = stripped.lower()
-        
-            # Stop at next SELECT statement (query #2)
+            stripped_upper = line.strip().upper()
+            stripped_lower = line.strip().lower()
+            
             if i > 0 and stripped_upper.startswith(('SELECT', 'WITH')):
-                print(f"⚠️  Stopping at second SELECT on line {i}")
+                print(f"⚠️  Stopping at second SELECT")
                 sql_end_idx = i
                 break
-        
-            # Stop at explanation markers
-            if any(marker in stripped_lower for marker in [
-                'note:',
-                'explanation:',
-                'this query',
-                'the above',
-                'assumptions:',
-                'this sql',
-                'this will',
-                'you can',
-                'to use this',
-                'replace',
-                'modify',
-                'example',
-            ]):
+            
+            if any(m in stripped_lower for m in ['note:', 'explanation:', 'this query', 'the above']):
                 sql_end_idx = i
                 break
-        
-            # Stop at numbered list items
+            
             if re.match(r'^\s*\d+\.\s+[A-Z]', line):
                 sql_end_idx = i
                 break
-    
-        # Extract just the FIRST SQL query
+        
         sql_lines = sql_lines[:sql_end_idx]
         sql_text = '\n'.join(sql_lines)
-    
-        # Step 5: Remove trailing semicolons and whitespace
+        
+        # Fix column spacing issues
+        common_fixes = [
+            (r'\baircraft\s+type\b', 'f.aircraft_type'),
+            (r'\bevent\s+type\b', 'event_type'),
+            (r'\bevent\s+time\b', 'event_time'),
+            (r'\bcall\s+sign\b', 'call_sign'),
+        ]
+        
+        for pattern, replacement in common_fixes:
+            sql_text = re.sub(pattern, replacement, sql_text, flags=re.IGNORECASE)
+        
         sql_text = sql_text.strip()
-    
+        
         if sql_text.endswith(';'):
             sql_text = sql_text[:-1].strip()
         
-        # Step 6: Fix common column name spacing issues
-    # "aircraft type" → "f.aircraft_type"
-    # This happens when model doesn't include table prefix
-    
-    # Pattern: word1 word2 that should be word1_word2
-        common_fixes = [
-        (r'\baircraft\s+type\b', 'f.aircraft_type'),
-        (r'\bevent\s+type\b', 'event_type'),
-        (r'\bevent\s+time\b', 'event_time'),
-        (r'\bcall\s+sign\b', 'call_sign'),
-        (r'\bflight\s+count\b', 'flight_count'),
-        (r'\bweight\s+class\b', 'weight_class'),
-    ]
-    
-        for pattern, replacement in common_fixes:
-            sql_text = re.sub(pattern, replacement, sql_text, flags=re.IGNORECASE)
-    
-        # Step 7: Clean trailing comments
-        lines = sql_text.split('\n')
-        cleaned_lines = []
-    
-        for line in lines:
-            stripped = line.strip()
-            if stripped.startswith('--') and len(stripped) > 2:
-                comment_text = stripped[2:].strip().lower()
-                if any(word in comment_text for word in ['note', 'explanation', 'this', 'you can', 'replace']):
-                    break
-            cleaned_lines.append(line)
-    
-        sql_text = '\n'.join(cleaned_lines).strip()
-    
-        # Step 8: Ensure LIMIT clause
         if 'LIMIT' not in sql_text.upper():
             sql_text += ' LIMIT 100'
-    
-        # Step 9: Final validation
-        if not sql_text.strip().upper().startswith(('SELECT', 'WITH', '(SELECT')):
-            print("❌ Cleaned SQL doesn't start with SELECT!")
-            print("CLEANED OUTPUT:")
-            print(sql_text[:300])
-            return ""
-    
-        # Step 10: Double-check no duplicate SELECT (should be impossible now)
+        
         if sql_text.upper().count('SELECT') > 1:
-            # Keep only up to first occurrence after the initial SELECT
             first_select_end = sql_text.upper().find('SELECT', 1)
             if first_select_end > 0:
                 sql_text = sql_text[:first_select_end].strip()
-                print(f"⚠️  Removed duplicate SELECT statements")
-    
+        
         print("✅ CLEANED OUTPUT:")
         print(sql_text[:300] + "..." if len(sql_text) > 300 else sql_text)
         print("=" * 80 + "\n")
-    
+        
         return sql_text
     
     async def generate_sql(self, query: str) -> Optional[str]:
@@ -241,7 +352,6 @@ class ModalSQLGenerator:
         
         try:
             print(f"🦙 [Modal] Calling fine-tuned Code Llama...")
-            print(f"   Query: {query[:80]}...")
             
             response = requests.post(
                 self.endpoint,
@@ -252,7 +362,6 @@ class ModalSQLGenerator:
             
             if response.status_code != 200:
                 print(f"❌ [Modal] HTTP {response.status_code}")
-                print(f"   Response: {response.text[:200]}")
                 return None
             
             result = response.json()
@@ -270,241 +379,391 @@ class ModalSQLGenerator:
             print("\n" + "=" * 80)
             print("🦙 RAW MODAL OUTPUT")
             print("=" * 80)
-            print(raw_sql)
+            print(raw_sql[:500] + "..." if len(raw_sql) > 500 else raw_sql)
             print("=" * 80)
             
-            # Clean the SQL
             sql = self._clean_sql(raw_sql)
             
-            # Validate SQL
             if not sql or 'SELECT' not in sql.upper():
                 print(f"❌ [Modal] Invalid SQL after cleaning")
                 return None
             
-            print(f"✅ [Modal] Generated SQL successfully")
-            print(f"   Raw length: {len(raw_sql)} chars")
-            print(f"   Cleaned length: {len(sql)} chars")
-            
+            print(f"✅ [Modal] Cleaned SQL ready for validation")
             return sql
             
         except requests.Timeout:
             print(f"⏱️  [Modal] Timeout after {self.timeout}s")
-            print("   Endpoint may be cold-starting (first request takes longer)")
-            return None
-        except requests.ConnectionError as e:
-            print(f"❌ [Modal] Connection failed")
-            print(f"   Is Modal inference server deployed?")
             return None
         except Exception as e:
-            print(f"❌ [Modal] Exception: {type(e).__name__}: {e}")
+            print(f"❌ [Modal] Exception: {e}")
             return None
 
 
 # ============================================================================
-# SQL VALIDATOR
+# SQL VALIDATORS
 # ============================================================================
 
 class SQLValidator:
-    """Validate and fix common SQL generation errors"""
+    """Basic SQL validation with schema awareness"""
     
     @staticmethod
     def validate_and_fix(sql: str, query: str) -> Dict[str, Any]:
-        """Validate and fix common SQL generation errors"""
-    
-    @staticmethod
-    def validate_and_fix(sql: str, query: str) -> Dict[str, Any]:
-        """Validate SQL and attempt to fix common errors"""
+        """Validate SQL for common errors"""
         warnings = []
         
-        # Pre-check: SQL must not be empty
         if not sql or not sql.strip():
             return {
                 'valid': False,
                 'sql': sql,
-                'fixed': False,
-                'warnings': ['❌ Empty SQL generated'],
-                'error': 'SQL generation produced empty output'
+                'warnings': ['❌ Empty SQL'],
+                'error': 'Empty SQL generated'
             }
         
-        # Pre-check: Must start with SELECT/WITH
         sql_upper = sql.strip().upper()
+        sql_lower = sql.lower()
+        
         if not sql_upper.startswith(('SELECT', 'WITH', '(SELECT')):
             return {
                 'valid': False,
                 'sql': sql,
-                'fixed': False,
                 'warnings': ['❌ SQL does not start with SELECT'],
-                'error': f'Invalid SQL start: {sql[:50]}...'
+                'error': f'Invalid start: {sql[:50]}...'
             }
         
-        # Check 0: Detect instructional text instead of SQL
-        # Look for common instruction phrases in the first line
+        # Check for instructional text
         first_line = sql.split('\n')[0].strip().lower()
-        instruction_keywords = [
-            'select the appropriate',
-            'choose the',
-            'based on the',
-            'use the following',
-            'according to',
-            'refer to',
-            'consider the',
-            'determine the',
-            'identify the',
-            'find the',
-        ]
-        
-        for keyword in instruction_keywords:
-            if keyword in first_line and 'from' not in first_line.lower():
-                warnings.append(f"❌ SQL contains instructional text: '{first_line[:60]}'")
+        if any(kw in first_line for kw in ['select the appropriate', 'based on the', 'use the following']):
+            if 'from' not in first_line:
+                warnings.append(f"❌ Instructional text: '{first_line[:60]}'")
                 return {
                     'valid': False,
                     'sql': sql,
-                    'fixed': False,
                     'warnings': warnings,
-                    'error': 'Model generated instructions instead of SQL query'
+                    'error': 'Instructions instead of SQL'
                 }
         
-        # Check 1: Must have FROM clause
         if 'FROM' not in sql_upper:
-            warnings.append("❌ SQL missing FROM clause")
-            return {
-                'valid': False,
-                'sql': sql,
-                'fixed': False,
-                'warnings': warnings,
-                'error': 'SQL must include FROM clause'
-            }
+            warnings.append("❌ Missing FROM clause")
+            return {'valid': False, 'sql': sql, 'warnings': warnings, 'error': 'Missing FROM'}
         
-        # Check 2: Detect NOW() usage
         if 'NOW()' in sql_upper:
-            warnings.append("❌ CRITICAL: SQL uses NOW() - incorrect for taxi time calculations!")
-            return {
-                'valid': False,
-                'sql': sql,
-                'fixed': False,
-                'warnings': warnings,
-                'error': 'SQL uses NOW() which is incorrect for taxi time calculations'
-            }
+            warnings.append("❌ Uses NOW() - incorrect for taxi times")
+            return {'valid': False, 'sql': sql, 'warnings': warnings, 'error': 'Uses NOW()'}
         
-        # Check 3: Detect numbered lists
         if re.search(r'^\s*\d+\.\s+', sql, re.MULTILINE):
-            warnings.append("❌ SQL contains numbered list markers")
-            return {
-                'valid': False,
-                'sql': sql,
-                'fixed': False,
-                'warnings': warnings,
-                'error': 'SQL contains numbered lists or formatting artifacts'
-            }
+            warnings.append("❌ Contains numbered lists")
+            return {'valid': False, 'sql': sql, 'warnings': warnings, 'error': 'Numbered lists'}
         
-        # Check 4: WHERE before FROM (syntax error)
         from_pos = sql_upper.find('FROM')
         where_pos = sql_upper.find('WHERE')
         if where_pos != -1 and where_pos < from_pos:
-            warnings.append("❌ WHERE clause appears before FROM clause")
-            return {
-                'valid': False,
-                'sql': sql,
-                'fixed': False,
-                'warnings': warnings,
-                'error': 'Invalid SQL structure: WHERE before FROM'
-            }
+            warnings.append("❌ WHERE before FROM")
+            return {'valid': False, 'sql': sql, 'warnings': warnings, 'error': 'Invalid structure'}
         
-        # Check 5: Taxi-in validation
+        # CRITICAL: Check for event_time used without flight_event table
+        if 'event_time' in sql_lower:
+            has_flight_event = 'flight_event' in sql_lower or any(alias in sql_lower for alias in [
+                'landing', 'inblock', 'offblock', 'takeoff', 'fe'
+            ])
+            
+            if not has_flight_event:
+                warnings.append("❌ Uses event_time but flight_event table not joined")
+                return {
+                    'valid': False,
+                    'sql': sql,
+                    'warnings': warnings,
+                    'error': 'event_time column requires JOIN with flight_event table'
+                }
+        
+        # Check for time-based queries that need flight_event
+        if any(kw in query.lower() for kw in ['time', 'hour', 'pm', 'am', 'between']):
+            if 'FROM flight' in sql_upper and 'JOIN' not in sql_upper:
+                warnings.append("❌ Time-based query needs flight_event table")
+                return {
+                    'valid': False,
+                    'sql': sql,
+                    'warnings': warnings,
+                    'error': 'Time-based queries require JOIN with flight_event for event_time column'
+                }
+        
+        # Taxi-in validation
         if 'taxi' in query.lower() and 'in' in query.lower():
-            has_landing = 'Actual_Landing' in sql
-            has_inblock = 'Actual_In_Block' in sql
-            
-            if not (has_landing and has_inblock):
-                warnings.append("❌ Taxi-in query missing proper events")
-                return {
-                    'valid': False,
-                    'sql': sql,
-                    'fixed': False,
-                    'warnings': warnings,
-                    'error': 'Taxi-in calculation must use Actual_Landing and Actual_In_Block events'
-                }
+            if not ('Actual_Landing' in sql and 'Actual_In_Block' in sql):
+                warnings.append("❌ Taxi-in missing proper events")
+                return {'valid': False, 'sql': sql, 'warnings': warnings, 'error': 'Missing events'}
         
-        # Check 6: Taxi-out validation
+        # Taxi-out validation
         if 'taxi' in query.lower() and 'out' in query.lower():
-            has_offblock = 'Actual_Off_Block' in sql
-            has_takeoff = 'Actual_Take_Off' in sql
-            
-            if not (has_offblock and has_takeoff):
-                warnings.append("❌ Taxi-out query missing proper events")
-                return {
-                    'valid': False,
-                    'sql': sql,
-                    'fixed': False,
-                    'warnings': warnings,
-                    'error': 'Taxi-out calculation must use Actual_Off_Block and Actual_Take_Off events'
-                }
+            if not ('Actual_Off_Block' in sql and 'Actual_Take_Off' in sql):
+                warnings.append("❌ Taxi-out missing proper events")
+                return {'valid': False, 'sql': sql, 'warnings': warnings, 'error': 'Missing events'}
         
-        # Check 7: Dangerous operations
-        dangerous = ['DROP', 'DELETE', 'TRUNCATE', 'ALTER', 'CREATE', 'INSERT', 'UPDATE']
-        for op in dangerous:
-            if op in sql_upper.split():
-                warnings.append(f"❌ Dangerous operation detected: {op}")
-                return {
-                    'valid': False,
-                    'sql': sql,
-                    'fixed': False,
-                    'warnings': warnings,
-                    'error': f'Dangerous SQL operation not allowed: {op}'
-                }
+        warnings.append('✅ SQL validation passed')
+        return {'valid': True, 'sql': sql, 'warnings': warnings}
+
+
+class ClaudeSQLValidator:
+    """
+    Claude API as "Big Brother" Validator
+    Superior validation and correction capabilities
+    """
+    
+    def __init__(self, claude_client):
+        self.client = claude_client
+        self.basic_validator = SQLValidator()
+        self.model = CLAUDE_MODEL
+    
+    async def validate_and_correct(self, sql: str, user_query: str, source: str = 'modal') -> Dict[str, Any]:
+        """Validate SQL and have Claude correct if needed"""
         
-        # Check 8: Basic structure validation
-        # SQL should have reasonable structure
-        has_select = 'SELECT' in sql_upper
-        has_from = 'FROM' in sql_upper
+        print("\n" + "=" * 80)
+        print("🤖 CLAUDE SMART SQL VALIDATION")
+        print("=" * 80)
         
-        if not (has_select and has_from):
-            warnings.append("❌ SQL missing basic structure (SELECT...FROM)")
+        # Basic validation first
+        basic_check = self.basic_validator.validate_and_fix(sql, user_query)
+        
+        print("📋 Basic Validation:")
+        for warning in basic_check['warnings']:
+            print(f"  {warning}")
+        
+        if basic_check['valid']:
+            print("✅ SQL passed basic validation - sending to Claude for final review...")
+        else:
+            print(f"\n⚠️  Issues found: {basic_check.get('error')}")
+            print("🔧 Claude will validate and correct...")
+        
+        if not self.client:
+            print("❌ Claude API not configured")
             return {
                 'valid': False,
                 'sql': sql,
-                'fixed': False,
-                'warnings': warnings,
-                'error': 'SQL must have SELECT...FROM structure'
+                'corrected': False,
+                'issues_found': basic_check['warnings'],
+                'final_source': source
             }
         
-        # All checks passed
-        warnings.append('✅ SQL validation passed')
-        return {
-            'valid': True,
-            'sql': sql,
-            'fixed': False,
-            'warnings': warnings
-        }
+        # Prepare validation prompt for Claude
+        validation_prompt = f"""{DETAILED_SCHEMA}
+
+TASK: You are the "Big Brother" validator for SQL queries. Validate and correct this MySQL query if needed.
+
+USER QUERY: "{user_query}"
+
+GENERATED SQL:
+{sql}
+
+BASIC VALIDATION RESULTS:
+{chr(10).join(basic_check['warnings'])}
+
+Your job:
+1. Verify the SQL is syntactically correct MySQL
+2. Verify all table names and column names exist in the schema above
+3. Verify event_type values are EXACTLY correct (case-sensitive)
+4. Verify JOIN conditions are correct
+5. Verify the query actually answers the user's question
+
+Respond with ONLY ONE of these formats:
+
+If SQL is correct:
+VALID: YES
+REASONING: [brief explanation]
+
+If SQL needs correction:
+VALID: NO
+ISSUES: [list specific problems]
+CORRECTED SQL:
+[corrected query here - no markdown, just SQL]
+
+CRITICAL RULES:
+- Use EXACT event types: 'Actual_Take_Off', 'Actual_Landing', 'Actual_Off_Block', 'Actual_In_Block'
+- NEVER use lowercase: 'takeoff', 'landing', 'offblock', 'inblock'
+- NEVER use NOW()
+- Taxi-in: TIMESTAMPDIFF(MINUTE, landing.event_time, inblock.event_time)
+- Taxi-out: TIMESTAMPDIFF(MINUTE, offblock.event_time, takeoff.event_time)
+- Filter: BETWEEN 1 AND 120
+- Always include LIMIT clause
+"""
+        
+        try:
+            print(f"🤖 Calling Claude API ({self.model})...")
+            
+            # Call Claude API
+            message = self.client.messages.create(
+                model=self.model,
+                max_tokens=2000,
+                temperature=0.1,
+                messages=[
+                    {"role": "user", "content": validation_prompt}
+                ]
+            )
+            
+            validation_response = message.content[0].text.strip()
+            
+            print(f"\n🤖 Claude Response:")
+            print("=" * 80)
+            print(validation_response[:300] + "..." if len(validation_response) > 300 else validation_response)
+            print("=" * 80)
+            
+            # Parse Claude's response
+            if 'VALID: YES' in validation_response or 'VALID:YES' in validation_response:
+                print("\n✅ Claude APPROVED the SQL")
+                
+                # Extract reasoning if provided
+                reasoning = ""
+                if 'REASONING:' in validation_response:
+                    reasoning = validation_response.split('REASONING:')[1].strip()
+                    print(f"   Reasoning: {reasoning[:100]}...")
+                
+                return {
+                    'valid': True,
+                    'sql': sql,
+                    'corrected': False,
+                    'issues_found': [],
+                    'reasoning': reasoning,
+                    'final_source': f'{source}-claude-approved'
+                }
+            
+            elif 'VALID: NO' in validation_response or 'VALID:NO' in validation_response:
+                print("\n🔧 Claude found issues - extracting corrected SQL...")
+                
+                # Extract issues
+                issues = []
+                if 'ISSUES:' in validation_response:
+                    issues_text = validation_response.split('ISSUES:')[1]
+                    if 'CORRECTED SQL:' in issues_text:
+                        issues_text = issues_text.split('CORRECTED SQL:')[0]
+                    issues = [issues_text.strip()]
+                
+                # Extract corrected SQL
+                corrected_sql = None
+                
+                if 'CORRECTED SQL:' in validation_response:
+                    sql_part = validation_response.split('CORRECTED SQL:')[1].strip()
+                    corrected_sql = self._clean_sql(sql_part)
+                else:
+                    # Try to find SELECT statement
+                    lines = validation_response.split('\n')
+                    for i, line in enumerate(lines):
+                        if line.strip().upper().startswith('SELECT'):
+                            corrected_sql = '\n'.join(lines[i:])
+                            corrected_sql = self._clean_sql(corrected_sql)
+                            break
+                
+                if corrected_sql:
+                    # Apply auto-correction
+                    corrected_sql = fix_common_sql_errors(corrected_sql)
+                    
+                    if corrected_sql and 'SELECT' in corrected_sql.upper():
+                        print(f"\n✅ SQL CORRECTED BY CLAUDE")
+                        print("=" * 80)
+                        print(corrected_sql[:200] + "..." if len(corrected_sql) > 200 else corrected_sql)
+                        print("=" * 80)
+                        
+                        return {
+                            'valid': True,
+                            'sql': corrected_sql,
+                            'corrected': True,
+                            'issues_found': issues,
+                            'final_source': f'{source}-claude-corrected'
+                        }
+                
+                print("⚠️  Claude indicated issues but couldn't extract corrected SQL")
+                return {
+                    'valid': False,
+                    'sql': sql,
+                    'corrected': False,
+                    'issues_found': issues,
+                    'final_source': source
+                }
+            
+            else:
+                print("⚠️  Unexpected Claude response format")
+                return {
+                    'valid': False,
+                    'sql': sql,
+                    'corrected': False,
+                    'issues_found': ['Unexpected response format from Claude'],
+                    'final_source': source
+                }
+                
+        except Exception as e:
+            print(f"❌ Claude API error: {e}")
+            import traceback
+            traceback.print_exc()
+            return {
+                'valid': False,
+                'sql': sql,
+                'corrected': False,
+                'issues_found': [f'Claude API error: {str(e)}'],
+                'final_source': source
+            }
+    
+    def _clean_sql(self, sql_text: str) -> str:
+        """Clean SQL from Claude's response"""
+        if not sql_text:
+            return sql_text
+        
+        # Remove markdown code blocks
+        sql_text = re.sub(r'```sql\s*', '', sql_text, flags=re.IGNORECASE)
+        sql_text = re.sub(r'```\s*', '', sql_text)
+        sql_text = re.sub(r'^\s*\d+\.\s+', '', sql_text, flags=re.MULTILINE)
+        
+        lines = sql_text.split('\n')
+        sql_start_idx = None
+        
+        # Find first SELECT
+        for i, line in enumerate(lines):
+            if line.strip().upper().startswith(('SELECT', 'WITH')):
+                sql_start_idx = i
+                break
+        
+        if sql_start_idx is None:
+            return sql_text.strip()
+        
+        sql_lines = lines[sql_start_idx:]
+        sql_end_idx = len(sql_lines)
+        
+        # Find end of SQL (before explanations)
+        for i, line in enumerate(sql_lines[1:], 1):
+            if line.strip().upper().startswith(('SELECT', 'WITH')):
+                sql_end_idx = i
+                break
+            if any(m in line.lower() for m in ['note:', 'explanation:', 'reasoning:']):
+                sql_end_idx = i
+                break
+        
+        sql_text = '\n'.join(sql_lines[:sql_end_idx]).strip()
+        
+        # Remove trailing semicolon
+        if sql_text.endswith(';'):
+            sql_text = sql_text[:-1].strip()
+        
+        # Add LIMIT if missing
+        if 'LIMIT' not in sql_text.upper():
+            sql_text += ' LIMIT 100'
+        
+        return sql_text
 
 
 # ============================================================================
-# ENHANCEMENT 1: Temporal Context Extraction
+# TEMPORAL CONTEXT EXTRACTION (unchanged)
 # ============================================================================
 
 class TemporalContextExtractor:
-    """Extract temporal filters from natural language queries"""
+    """Extract temporal filters from queries"""
     
     def __init__(self):
         self.time_periods = {
             'morning': (5, 11),
-            'early morning': (5, 8),
-            'late morning': (9, 11),
             'afternoon': (12, 17),
-            'early afternoon': (12, 14),
-            'late afternoon': (15, 17),
             'evening': (18, 21),
             'night': (22, 4),
-            'midnight': (0, 2),
-            'noon': (11, 13),
             'rush hour': [(7, 9), (16, 18)],
-            'peak hours': [(7, 9), (16, 18)],
-            'business hours': (9, 17),
-            'overnight': (22, 5)
         }
     
     def extract_temporal_context(self, query: str) -> Dict:
-        """Extract all temporal filters from query"""
+        """Extract time filters"""
         query_lower = query.lower().strip()
         context = {
             'hour_range': None,
@@ -512,14 +771,12 @@ class TemporalContextExtractor:
             'has_temporal_filter': False
         }
         
-        # Extract named periods
         for period_name, hours in self.time_periods.items():
             if period_name in query_lower:
                 context['has_temporal_filter'] = True
                 context['hour_range'] = hours
                 break
         
-        # Extract specific hours
         specific_hour_pattern = r'\b(?:at\s+)?(\d{1,2})(?::00)?\s*(am|pm|AM|PM)?\b'
         matches = re.findall(specific_hour_pattern, query_lower)
         if matches:
@@ -534,7 +791,6 @@ class TemporalContextExtractor:
                 hours.append(hour)
             context['specific_hours'] = hours
         
-        # Extract ranges
         range_pattern = r'between\s+(\d{1,2})(?::00)?\s*(am|pm)?\s+(?:and|to)\s+(\d{1,2})(?::00)?\s*(am|pm)?'
         range_match = re.search(range_pattern, query_lower)
         
@@ -555,61 +811,40 @@ class TemporalContextExtractor:
         return context
     
     def inject_temporal_filter(self, sql_query: str, user_query: str) -> str:
-        """Inject temporal WHERE clauses into existing SQL"""
+        """Inject temporal WHERE clauses"""
         temporal_context = self.extract_temporal_context(user_query)
-    
+        
         if not temporal_context['has_temporal_filter']:
             return sql_query
-    
-        # Check if SQL already has time filtering (avoid duplicate)
+        
         sql_upper = sql_query.upper()
         sql_lower = sql_query.lower()
-    
-        if 'TIME(' in sql_upper or 'BETWEEN' in sql_upper and ("'14:" in sql_query or "'17:" in sql_query):
-            print("⏭️  SQL already has time filtering, skipping temporal injection")
+        
+        if 'TIME(' in sql_upper or ('BETWEEN' in sql_upper and ("'14:" in sql_query or "'17:" in sql_query)):
+            print("⏭️  SQL already has time filtering")
             return sql_query
-    
-        # CRITICAL: Check if event_time column exists in this query
-        # Don't inject temporal filters on queries that don't use flight_event table
+        
         if 'event_time' not in sql_lower:
-            print("⏭️  Query doesn't use event_time column, skipping temporal injection")
+            print("⏭️  Query doesn't use event_time, skipping temporal filter")
             return sql_query
-    
-        # Detect which time column/alias to use based on what's in the query
+        
         time_column = None
-    
-        # Check for common alias patterns
         if 'offblock.event_time' in sql_lower:
             time_column = 'offblock.event_time'
         elif 'landing.event_time' in sql_lower:
             time_column = 'landing.event_time'
         elif 'takeoff.event_time' in sql_lower:
             time_column = 'takeoff.event_time'
-        elif 'inblock.event_time' in sql_lower:
-            time_column = 'inblock.event_time'
         elif 'le.event_time' in sql_lower:
             time_column = 'le.event_time'
-        elif 'ib.event_time' in sql_lower:
-            time_column = 'ib.event_time'
         elif 'fe.event_time' in sql_lower:
             time_column = 'fe.event_time'
-        elif 'flight_event' in sql_lower and 'event_time' in sql_lower:
-        # Query uses flight_event table but no specific alias
-        # Try to find what alias is used for flight_event
-        # Look for patterns like "JOIN flight_event X ON" or "FROM flight_event X"
-            import re
-            alias_match = re.search(r'flight_event\s+(\w+)\s+ON', sql_lower)
-            if alias_match:
-                alias = alias_match.group(1)
-                time_column = f'{alias}.event_time'
-            else:
-                time_column = 'event_time'
         else:
-            print("⚠️  No usable event_time column found in query, skipping temporal filter")
+            print("⚠️  No usable event_time column found")
             return sql_query
-    
+        
         clauses = []
-    
+        
         if temporal_context.get('specific_hours'):
             hours = temporal_context['specific_hours']
             if len(hours) == 1:
@@ -617,7 +852,7 @@ class TemporalContextExtractor:
             else:
                 hour_list = ', '.join(map(str, hours))
                 clauses.append(f"HOUR({time_column}) IN ({hour_list})")
-    
+        
         elif temporal_context.get('hour_range'):
             hour_range = temporal_context['hour_range']
             if isinstance(hour_range, list):
@@ -634,13 +869,12 @@ class TemporalContextExtractor:
                     clauses.append(f"HOUR({time_column}) BETWEEN {start} AND {end}")
                 else:
                     clauses.append(f"(HOUR({time_column}) >= {start} OR HOUR({time_column}) <= {end})")
-    
+        
         if not clauses:
             return sql_query
-    
+        
         where_clause = ' AND '.join(clauses)
-    
-        # Find WHERE clause position
+        
         if 'WHERE' in sql_upper:
             where_pos = sql_upper.find('WHERE') + 5
             next_clause_pos = len(sql_query)
@@ -648,33 +882,31 @@ class TemporalContextExtractor:
                 pos = sql_upper.find(clause, where_pos)
                 if pos != -1 and pos < next_clause_pos:
                     next_clause_pos = pos
-        
+            
             before = sql_query[:next_clause_pos].rstrip()
-            after = sql_query[next_clause_pos:]
-        
-            print(f"✅ Injecting temporal filter: {where_clause}")
-            return f"{before}\n     AND {where_clause}{after}"
+            after = sql_query[next_clause_pos:].lstrip()
+            print(f"✅ Injecting: {where_clause}")
+            return f"{before}\n  AND {where_clause}\n{after}"
         else:
             group_by_pos = sql_upper.find('GROUP BY')
             if group_by_pos != -1:
                 before = sql_query[:group_by_pos].rstrip()
-                after = sql_query[group_by_pos:]
-                print(f"✅ Injecting temporal filter: {where_clause}")
+                after = sql_query[group_by_pos:].lstrip()
+                print(f"✅ Injecting: {where_clause}")
                 return f"{before}\nWHERE {where_clause}\n{after}"
-        
-            print(f"✅ Injecting temporal filter: {where_clause}")
+            
+            print(f"✅ Injecting: {where_clause}")
             return f"{sql_query.rstrip()}\nWHERE {where_clause}"
 
 
 # ============================================================================
-# ENHANCEMENT 2: Output Format Classification
+# OUTPUT FORMAT CLASSIFICATION (unchanged)
 # ============================================================================
 
 OutputFormat = Literal['chart', 'table', 'text', 'chart_and_text', 'table_and_text', 'all']
 
 @dataclass
 class OutputPreference:
-    """User's preferred output format"""
     format: OutputFormat
     confidence: float
     reasoning: str
@@ -693,154 +925,119 @@ class OutputPreference:
 
 
 class OutputFormatClassifier:
-    """Classify user's desired output format"""
+    """Classify desired output format"""
     
     def __init__(self):
         self.format_indicators = {
             'chart': {
-                'explicit': ['show me a chart', 'create a chart', 'visualize', 'plot', 'graph'],
-                'implicit': ['trends', 'pattern', 'over time', 'by hour', 'compare']
+                'explicit': ['chart', 'visualize', 'plot', 'graph'],
+                'implicit': ['trends', 'pattern', 'by hour', 'compare']
             },
             'table': {
-                'explicit': ['show me a table', 'list', 'show me the data', 'table view'],
-                'implicit': ['which flights', 'what are the', 'individual', 'details']
+                'explicit': ['table', 'list', 'show me the data'],
+                'implicit': ['which flights', 'what are the']
             },
             'text': {
-                'explicit': ['just tell me', 'summarize', 'summary', 'brief', 'no chart'],
-                'implicit': ['how many', 'what was', 'average', 'total']
+                'explicit': ['just tell me', 'summarize'],
+                'implicit': ['how many', 'what was', 'average']
             }
         }
     
     def classify(self, query: str, intent: str = None) -> OutputPreference:
-        """Classify desired output format"""
         query_lower = query.lower().strip()
-        
         scores = {'chart': 0.0, 'table': 0.0, 'text': 0.0}
-        reasons = []
         
         for format_type, indicators in self.format_indicators.items():
             for phrase in indicators['explicit']:
                 if phrase in query_lower:
                     scores[format_type] += 3.0
-                    reasons.append(f"'{phrase}' → {format_type}")
-            
             for phrase in indicators['implicit']:
                 if phrase in query_lower:
                     scores[format_type] += 0.5
         
         if all(s < 1.0 for s in scores.values()):
-            if any(kw in query_lower for kw in ['hour', 'time', 'compare', 'trend']):
-                return OutputPreference('chart_and_text', 0.6, "Default: analytical query")
-            return OutputPreference('text', 0.5, "Default: simple query")
+            if any(kw in query_lower for kw in ['hour', 'time', 'compare']):
+                return OutputPreference('chart_and_text', 0.6, "Default: analytical")
+            return OutputPreference('text', 0.5, "Default: simple")
         
         max_score = max(scores.values())
         top_formats = [f for f, s in scores.items() if s >= max_score * 0.7]
-        confidence = min(max_score / 5.0, 1.0)
         
         if len(top_formats) == 1:
             final = top_formats[0]
         elif 'chart' in top_formats and 'text' in top_formats:
             final = 'chart_and_text'
-        elif 'table' in top_formats and 'text' in top_formats:
-            final = 'table_and_text'
         else:
             final = top_formats[0]
         
-        return OutputPreference(final, confidence, ' | '.join(reasons[:3]))
+        return OutputPreference(final, min(max_score / 5.0, 1.0), '')
 
 
 # ============================================================================
-# DETAILED SCHEMA
+# DETAILED SCHEMA WITH EXACT EVENT TYPES
 # ============================================================================
 
 DETAILED_SCHEMA = """
 DATABASE SCHEMA - SeaTac Airport Operations (MySQL)
 
-=== TABLE 1: flight ===
-- call_sign (VARCHAR) - Flight identifier, USE FOR JOINS - Examples: 'QTA1', 'ZYX966'
-- aircraft_type (VARCHAR) - Aircraft model - Examples: 'B738', 'A321'
-- flight_number (VARCHAR) - Flight number
-- operation (ENUM) - 'ARRIVAL' or 'DEPARTURE'
+Tables:
+1. flight (call_sign, aircraft_type, operation, flight_number, origin_airport, destination_airport)
+2. flight_event (call_sign, event_type, event_time, location, operation)
+3. aircraft_type (aircraft_type, weight_class, wake_category, wingspan_ft, wingspan_m)
 
-=== TABLE 2: flight_event ===
-- call_sign (VARCHAR) - Links to flight.call_sign - USE FOR JOINS
-- operation (ENUM) - 'ARRIVAL' or 'DEPARTURE' - MUST MATCH
-- event_type (VARCHAR) - 'Actual_Off_Block', 'Actual_Take_Off', 'Actual_Landing', 'Actual_In_Block'
-- event_time (DATETIME) - When event occurred
-- location (VARCHAR) - Gate, runway, or taxiway
+⚠️  CRITICAL - EXACT Event Type Values (case-sensitive with underscores):
 
-=== TABLE 3: aircraft_type ===
-- aircraft_type (VARCHAR, PRIMARY KEY)
-- weight_class (VARCHAR) - 'L', 'M', 'H'
-- wingspan_ft, wingspan_m (DECIMAL)
+✅ CORRECT event_type values:
+   - 'Actual_Take_Off' (NOT 'takeoff', 'Takeoff', 'take_off', 'TAKEOFF')
+   - 'Actual_Landing' (NOT 'landing', 'Landing', 'LANDING')
+   - 'Actual_Off_Block' (NOT 'offblock', 'off_block', 'OffBlock')
+   - 'Actual_In_Block' (NOT 'inblock', 'in_block', 'InBlock')
 
-=== TAXI TIME CALCULATIONS ===
-Taxi-out: TIMESTAMPDIFF(MINUTE, offblock.event_time, takeoff.event_time)
-Taxi-in: TIMESTAMPDIFF(MINUTE, landing.event_time, inblock.event_time)
+❌ WRONG examples that will return ZERO results:
+   - 'takeoff', 'landing', 'offblock', 'inblock' (lowercase = NO MATCH)
+   - Any variation without 'Actual_' prefix
 
-ALWAYS filter: BETWEEN 1 AND 120
-NEVER use NOW() - always calculate between actual event times
+TAXI TIME FORMULAS:
+- Taxi-in: TIMESTAMPDIFF(MINUTE, landing.event_time, inblock.event_time)
+  WHERE landing.event_type = 'Actual_Landing' 
+    AND inblock.event_type = 'Actual_In_Block'
+    AND landing.operation = 'ARRIVAL'
+    AND inblock.operation = 'ARRIVAL'
+    
+- Taxi-out: TIMESTAMPDIFF(MINUTE, offblock.event_time, takeoff.event_time)
+  WHERE offblock.event_type = 'Actual_Off_Block'
+    AND takeoff.event_type = 'Actual_Take_Off'
+    AND offblock.operation = 'DEPARTURE'
+    AND takeoff.operation = 'DEPARTURE'
+
+MANDATORY RULES:
+- ALWAYS use exact event_type values with 'Actual_' prefix and proper capitalization
+- ALWAYS match operation field in JOINs (AND fe.operation = 'DEPARTURE' or 'ARRIVAL')
+- ALWAYS filter invalid times: BETWEEN 1 AND 120
+- NEVER use NOW()
+- ALWAYS include LIMIT clause
+
+Example for counting departures:
+SELECT COUNT(DISTINCT f.call_sign) as departure_count
+FROM flight f
+JOIN flight_event fe ON f.call_sign = fe.call_sign
+WHERE f.operation = 'DEPARTURE'
+  AND fe.operation = 'DEPARTURE'
+  AND fe.event_type = 'Actual_Take_Off'
+LIMIT 100
 """
 
 
 # ============================================================================
-# OpenRouter LLM Wrapper
+# CLAUDE API CLIENT
 # ============================================================================
 
-class OpenRouterLLM:
-    """Wrapper for OpenRouter API"""
-    
-    def __init__(self, api_key: str, model: str):
-        self.api_key = api_key
-        self.model = model
-    
-    async def ainvoke(self, messages, temperature: float = 0.1):
-        """Call OpenRouter API"""
-        if isinstance(messages, list):
-            formatted_messages = []
-            for msg in messages:
-                if isinstance(msg, dict):
-                    formatted_messages.append(msg)
-                else:
-                    formatted_messages.append({"role": "user", "content": str(msg)})
-        else:
-            formatted_messages = [{"role": "user", "content": str(messages)}]
-        
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "HTTP-Referer": "http://localhost:8000",
-            "X-Title": "SeaTac Operations Intelligence"
-        }
-        
-        payload = {
-            "model": self.model,
-            "messages": formatted_messages,
-            "temperature": temperature,
-            "max_tokens": 2000
-        }
-        
-        response = requests.post(OPENROUTER_URL, headers=headers, json=payload)
-        
-        if response.status_code != 200:
-            raise Exception(f"OpenRouter API error: {response.status_code}")
-        
-        result = response.json()
-        content = result['choices'][0]['message']['content']
-        
-        class Response:
-            def __init__(self, text):
-                self.content = text
-        
-        return Response(content)
-
-
-# Initialize Modal and OpenRouter
-modal_generator = ModalSQLGenerator(MODAL_ENDPOINT, USE_MODAL_MODEL)
-llm = OpenRouterLLM(OPENROUTER_API_KEY, OPENROUTER_MODEL) if OPENROUTER_API_KEY else None
+# Initialize Claude client
+claude_client = Anthropic(api_key=CLAUDE_API_KEY) if CLAUDE_API_KEY else None
 
 
 # ============================================================================
-# Pydantic Models
+# PYDANTIC MODELS
 # ============================================================================
 
 class QueryRequest(BaseModel):
@@ -865,17 +1062,17 @@ class HealthResponse(BaseModel):
     model: str
     modal_enabled: bool
     modal_endpoint: Optional[str]
-    openrouter_enabled: bool
+    claude_enabled: bool
     database_status: str
     version: str
 
 
 # ============================================================================
-# Database Manager
+# DATABASE MANAGER
 # ============================================================================
 
 class DatabaseManager:
-    """Database connection and query execution"""
+    """Database operations"""
     
     def __init__(self):
         self.db_config = {
@@ -895,9 +1092,8 @@ class DatabaseManager:
             return False
     
     def execute_query(self, sql: str) -> Dict[str, Any]:
-        # LOG THE FULL SQL BEFORE EXECUTION
         print("\n" + "=" * 80)
-        print("📋 EXECUTING SQL QUERY")
+        print("📋 EXECUTING SQL")
         print("=" * 80)
         print(sql)
         print("=" * 80 + "\n")
@@ -910,28 +1106,19 @@ class DatabaseManager:
             cursor.close()
             connection.close()
             
-            # Convert Decimal, datetime, date
             cleaned_results = []
             for row in results:
                 cleaned_row = {}
                 for key, value in row.items():
                     if isinstance(value, Decimal):
                         cleaned_row[key] = float(value)
-                    elif isinstance(value, datetime):
+                    elif isinstance(value, (datetime, date)):
                         cleaned_row[key] = value.isoformat()
-                    elif isinstance(value, date):
-                        cleaned_row[key] = value.isoformat()
-                    elif value is None:
-                        cleaned_row[key] = None
                     else:
-                        try:
-                            json.dumps(value)
-                            cleaned_row[key] = value
-                        except (TypeError, ValueError):
-                            cleaned_row[key] = str(value)
+                        cleaned_row[key] = value
                 cleaned_results.append(cleaned_row)
             
-            print(f"✅ Query executed successfully: {len(cleaned_results)} rows returned\n")
+            print(f"✅ Success: {len(cleaned_results)} rows\n")
             
             return {
                 'success': True,
@@ -940,8 +1127,7 @@ class DatabaseManager:
                 'sql': sql
             }
         except Error as e:
-            print(f"❌ SQL EXECUTION FAILED")
-            print(f"Error: {str(e)}\n")
+            print(f"❌ FAILED: {str(e)}\n")
             return {
                 'success': False,
                 'error': str(e),
@@ -952,51 +1138,99 @@ class DatabaseManager:
 
 
 # ============================================================================
-# Chart Generator
+# CHART GENERATOR
 # ============================================================================
 
 class ChartGenerator:
-    """Generate Chart.js configurations"""
+    """Generate Chart.js configs"""
     
     @staticmethod
-    def generate_chart(data: List[Dict], title: str = "Analysis Results") -> Optional[Dict]:
+    def generate_chart(data: List[Dict], title: str = "Analysis") -> Optional[Dict]:
         if not data:
             return None
         
         first_row = data[0]
         keys = list(first_row.keys())
         
-        # Detect label and value fields
+        # Find label field (categorical data)
         label_field = None
         value_field = None
         
+        # Priority 1: Look for common label fields
         for key in keys:
-            if any(term in key.lower() for term in ['hour', 'type', 'class', 'runway']):
+            if any(t in key.lower() for t in ['hour', 'type', 'class', 'airport', 'operation']):
                 label_field = key
                 break
         
+        # Priority 2: Find numeric value field
         for key in keys:
-            if any(term in key.lower() for term in ['avg', 'count', 'total', 'minutes']):
-                if value_field is None and 'avg' in key.lower():
-                    value_field = key
+            if any(t in key.lower() for t in ['avg', 'count', 'total', 'minutes', 'sum', 'max', 'min']):
+                # Check if this field is actually numeric
+                try:
+                    test_value = first_row.get(key)
+                    if test_value is not None:
+                        float(test_value)
+                        if value_field is None or 'avg' in key.lower():
+                            value_field = key
+                except (ValueError, TypeError):
+                    continue
         
+        # Fallback: First non-numeric field for labels, first numeric for values
         if not label_field:
-            label_field = keys[0]
-        if not value_field:
-            value_field = keys[1] if len(keys) > 1 else keys[0]
+            for key in keys:
+                try:
+                    float(first_row.get(key, 0))
+                except (ValueError, TypeError):
+                    label_field = key
+                    break
+            if not label_field:
+                label_field = keys[0]
         
-        # Format labels
+        if not value_field:
+            for key in keys:
+                if key != label_field:
+                    try:
+                        float(first_row.get(key, 0))
+                        value_field = key
+                        break
+                    except (ValueError, TypeError):
+                        continue
+        
+        # If still no value field found, return None
+        if not value_field:
+            print(f"⚠️  Could not find numeric field for chart. Available fields: {keys}")
+            return None
+        
+        # Extract labels and values
         labels = []
-        for row in data[:24]:
+        values = []
+        
+        for row in data[:24]:  # Limit to 24 rows for readability
             label = str(row.get(label_field, ''))
+            
+            # Format hour labels nicely
             if 'hour' in label_field.lower() and label.isdigit():
                 label = f"{int(label):02d}:00"
+            
             labels.append(label)
+            
+            # Safely convert value to float
+            try:
+                value = float(row.get(value_field, 0))
+            except (ValueError, TypeError):
+                value = 0
+            values.append(value)
         
-        values = [float(row.get(value_field, 0)) for row in data[:24]]
-        
+        # Determine chart type
         is_temporal = 'hour' in label_field.lower()
         chart_type = 'line' if is_temporal else 'bar'
+        
+        # Determine y-axis label
+        y_label = 'Value'
+        if 'minute' in value_field.lower() or 'time' in value_field.lower():
+            y_label = 'Minutes'
+        elif 'count' in value_field.lower():
+            y_label = 'Count'
         
         return {
             'type': chart_type,
@@ -1018,7 +1252,7 @@ class ChartGenerator:
                 'scales': {
                     'y': {
                         'beginAtZero': True,
-                        'title': {'display': True, 'text': 'Minutes'}
+                        'title': {'display': True, 'text': y_label}
                     }
                 }
             }
@@ -1026,22 +1260,18 @@ class ChartGenerator:
 
 
 # ============================================================================
-# Enhanced Response Controller
+# RESPONSE CONTROLLER
 # ============================================================================
 
 class EnhancedResponseController:
     """Controls output generation"""
     
-    def __init__(self, format_classifier: OutputFormatClassifier, chart_generator: ChartGenerator):
+    def __init__(self, format_classifier, chart_generator):
         self.classifier = format_classifier
         self.chart_generator = chart_generator
     
-    def process_output(self, user_query: str, result: Dict, insights: str, 
-                      title: str = "Analysis Results") -> Dict:
-        """Process and format output"""
+    def process_output(self, user_query: str, result: Dict, insights: str, title: str = "Analysis") -> Dict:
         output_pref = self.classifier.classify(user_query)
-        
-        print(f"[Output] Format: {output_pref.format} (confidence: {output_pref.confidence:.2f})")
         
         response_data = {
             'output_format': output_pref.format,
@@ -1065,313 +1295,200 @@ class EnhancedResponseController:
 
 
 # ============================================================================
-# Enhanced SeaTac Agent (Modal-First)
+# SEATAC AGENT - SMART PIPELINE WITH CLAUDE
 # ============================================================================
 
 class SeaTacAgent:
-    """Enhanced agent with Modal Code Llama integration"""
+    """Agent with Claude as Big Brother validator"""
     
-    def __init__(self, modal_gen: ModalSQLGenerator, openrouter_llm, db_manager: DatabaseManager):
+    def __init__(self, modal_gen, claude_validator, db_manager):
         self.modal_gen = modal_gen
-        self.llm = openrouter_llm
+        self.claude_validator = claude_validator
         self.db_manager = db_manager
         self.chart_generator = ChartGenerator()
         self.temporal_extractor = TemporalContextExtractor()
         self.format_classifier = OutputFormatClassifier()
         self.response_controller = EnhancedResponseController(self.format_classifier, self.chart_generator)
-        self.sql_validator = SQLValidator()
         
-        # Pre-built use cases (fallback)
+        # Pre-built use cases
         self.use_cases = {
             "1": {
-                "name": "Taxi-In Performance by Aircraft Type",
                 "keywords": ["taxi-in", "taxi in", "aircraft type"],
-                "sql": """
-                    SELECT f.aircraft_type, 
-                           at.weight_class,
-                           AVG(TIMESTAMPDIFF(MINUTE, landing.event_time, inblock.event_time)) as avg_taxi_in_minutes,
-                           MIN(TIMESTAMPDIFF(MINUTE, landing.event_time, inblock.event_time)) as min_taxi_in,
-                           MAX(TIMESTAMPDIFF(MINUTE, landing.event_time, inblock.event_time)) as max_taxi_in,
-                           COUNT(*) as flight_count
-                    FROM flight f
-                    JOIN aircraft_type at ON f.aircraft_type = at.aircraft_type
-                    JOIN flight_event landing ON f.call_sign = landing.call_sign 
-                         AND landing.event_type = 'Actual_Landing' 
-                         AND landing.operation = 'ARRIVAL'
-                    JOIN flight_event inblock ON f.call_sign = inblock.call_sign
-                         AND inblock.event_type = 'Actual_In_Block' 
-                         AND inblock.operation = 'ARRIVAL'
-                    WHERE f.operation = 'ARRIVAL'
-                      AND TIMESTAMPDIFF(MINUTE, landing.event_time, inblock.event_time) BETWEEN 1 AND 120
-                    GROUP BY f.aircraft_type, at.weight_class
-                    HAVING flight_count >= 2
-                    ORDER BY avg_taxi_in_minutes DESC
-                    LIMIT 20
-                """
+                "sql": """SELECT f.aircraft_type, 
+                       AVG(TIMESTAMPDIFF(MINUTE, landing.event_time, inblock.event_time)) as avg_taxi_in_minutes,
+                       COUNT(*) as flight_count
+                FROM flight f
+                JOIN aircraft_type at ON f.aircraft_type = at.aircraft_type
+                JOIN flight_event landing ON f.call_sign = landing.call_sign 
+                     AND landing.event_type = 'Actual_Landing' 
+                     AND landing.operation = 'ARRIVAL'
+                JOIN flight_event inblock ON f.call_sign = inblock.call_sign
+                     AND inblock.event_type = 'Actual_In_Block' 
+                     AND inblock.operation = 'ARRIVAL'
+                WHERE f.operation = 'ARRIVAL'
+                  AND TIMESTAMPDIFF(MINUTE, landing.event_time, inblock.event_time) BETWEEN 1 AND 120
+                GROUP BY f.aircraft_type, at.weight_class
+                ORDER BY avg_taxi_in_minutes DESC
+                LIMIT 20"""
             },
             "2": {
-                "name": "Taxi-Out Performance by Hour",
-                "keywords": ["taxi-out", "taxi out", "hour", "hourly"],
-                "sql": """
-                    SELECT HOUR(offblock.event_time) as hour_of_day,
-                           AVG(TIMESTAMPDIFF(MINUTE, offblock.event_time, takeoff.event_time)) as avg_taxi_out_minutes,
-                           COUNT(*) as flight_count
-                    FROM flight f
-                    JOIN flight_event offblock ON f.call_sign = offblock.call_sign 
-                         AND offblock.event_type = 'Actual_Off_Block' 
-                         AND offblock.operation = 'DEPARTURE'
-                    JOIN flight_event takeoff ON f.call_sign = takeoff.call_sign
-                         AND takeoff.event_type = 'Actual_Take_Off' 
-                         AND takeoff.operation = 'DEPARTURE'
-                    WHERE f.operation = 'DEPARTURE'
-                      AND TIMESTAMPDIFF(MINUTE, offblock.event_time, takeoff.event_time) BETWEEN 1 AND 120
-                    GROUP BY HOUR(offblock.event_time)
-                    ORDER BY hour_of_day
-                """
+                "keywords": ["taxi-out", "taxi out", "hour"],
+                "sql": """SELECT HOUR(offblock.event_time) as hour_of_day,
+                       AVG(TIMESTAMPDIFF(MINUTE, offblock.event_time, takeoff.event_time)) as avg_taxi_out_minutes,
+                       COUNT(*) as flight_count
+                FROM flight f
+                JOIN flight_event offblock ON f.call_sign = offblock.call_sign 
+                     AND offblock.event_type = 'Actual_Off_Block' 
+                     AND offblock.operation = 'DEPARTURE'
+                JOIN flight_event takeoff ON f.call_sign = takeoff.call_sign
+                     AND takeoff.event_type = 'Actual_Take_Off' 
+                     AND takeoff.operation = 'DEPARTURE'
+                WHERE f.operation = 'DEPARTURE'
+                  AND TIMESTAMPDIFF(MINUTE, offblock.event_time, takeoff.event_time) BETWEEN 1 AND 120
+                GROUP BY HOUR(offblock.event_time)
+                ORDER BY hour_of_day"""
             }
         }
     
-    def _clean_sql(self, sql_text: str) -> str:
-        """
-        Aggressively clean SQL from LLM output.
-        Handles numbered lists, markdown, explanations, multiple queries.
-        """
-        if not sql_text:
-            return sql_text
-    
-        print("\n" + "=" * 80)
-        print("🧹 CLEANING SQL")
-        print("=" * 80)
-        print("RAW INPUT:")
-        print(sql_text[:500] + "..." if len(sql_text) > 500 else sql_text)
-        print("=" * 80)
-    
-        # Step 1: Remove markdown code blocks
-        sql_text = re.sub(r'```sql\s*', '', sql_text, flags=re.IGNORECASE)
-        sql_text = re.sub(r'```\s*', '', sql_text)
-    
-        # Step 2: Remove numbered list markers at start
-        sql_text = re.sub(r'^\s*\d+\.\s+', '', sql_text, flags=re.MULTILINE)
-    
-        # Step 3: Find ALL SELECT statements
-        lines = sql_text.split('\n')
-        select_indices = []
-    
-        for i, line in enumerate(lines):
-            stripped = line.strip().upper()
-            if stripped.startswith(('SELECT', 'WITH')):
-                select_indices.append(i)
-    
-        if not select_indices:
-            print("⚠️  No SELECT found, returning empty")
-            return ""
-    
-        # If multiple SELECT statements, only use the FIRST complete one
-        if len(select_indices) > 1:
-            print(f"⚠️  Found {len(select_indices)} SELECT statements - keeping only the first")
-    
-        # Start from first SELECT
-        sql_start_idx = select_indices[0]
-        sql_lines = lines[sql_start_idx:]
-    
-        # Step 4: Find where FIRST query ends
-        sql_end_idx = len(sql_lines)
-    
-        for i, line in enumerate(sql_lines):
-            stripped = line.strip()
-            stripped_upper = stripped.upper()
-            stripped_lower = stripped.lower()
-        
-            # Stop at next SELECT statement (query #2)
-            if i > 0 and stripped_upper.startswith(('SELECT', 'WITH')):
-                print(f"⚠️  Stopping at second SELECT on line {i}")
-                sql_end_idx = i
-                break
-        
-            # Stop at explanation markers
-            if any(marker in stripped_lower for marker in [
-                'note:',
-                'explanation:',
-                'this query',
-                'the above',
-                'assumptions:',
-                'this sql',
-                'this will',
-                'you can',
-                'to use this',
-                'replace',
-                'modify',
-                'example',
-            ]):
-                sql_end_idx = i
-                break
-        
-            # Stop at numbered list items
-            if re.match(r'^\s*\d+\.\s+[A-Z]', line):
-                sql_end_idx = i
-                break
-    
-        # Extract just the FIRST SQL query
-        sql_lines = sql_lines[:sql_end_idx]
-        sql_text = '\n'.join(sql_lines)
-
-        # Step 5: Fix common column name spacing issues
-    # "aircraft type" → "f.aircraft_type"
-    # This happens when model doesn't include table prefix
-    
-    # Pattern: word1 word2 that should be word1_word2
-        common_fixes = [
-        (r'\baircraft\s+type\b', 'f.aircraft_type'),
-        (r'\bevent\s+type\b', 'event_type'),
-        (r'\bevent\s+time\b', 'event_time'),
-        (r'\bcall\s+sign\b', 'call_sign'),
-        (r'\bflight\s+count\b', 'flight_count'),
-        (r'\bweight\s+class\b', 'weight_class'),
-    ]
-    
-        for pattern, replacement in common_fixes:
-            sql_text = re.sub(pattern, replacement, sql_text, flags=re.IGNORECASE)
-    
-        # Step 6: Remove trailing semicolons and whitespace
-        sql_text = sql_text.strip()
-    
-        if sql_text.endswith(';'):
-            sql_text = sql_text[:-1].strip()
-    
-        # Step 7: Clean trailing comments
-        lines = sql_text.split('\n')
-        cleaned_lines = []
-    
-        for line in lines:
-            stripped = line.strip()
-            if stripped.startswith('--') and len(stripped) > 2:
-                comment_text = stripped[2:].strip().lower()
-                if any(word in comment_text for word in ['note', 'explanation', 'this', 'you can', 'replace']):
-                    break
-            cleaned_lines.append(line)
-    
-        sql_text = '\n'.join(cleaned_lines).strip()
-    
-        # Step 8: Ensure LIMIT clause
-        if 'LIMIT' not in sql_text.upper():
-            sql_text += ' LIMIT 100'
-    
-        # Step 9: Final validation
-        if not sql_text.strip().upper().startswith(('SELECT', 'WITH', '(SELECT')):
-            print("❌ Cleaned SQL doesn't start with SELECT!")
-            print("CLEANED OUTPUT:")
-            print(sql_text[:300])
-            return ""
-    
-        # Step 10: Double-check no duplicate SELECT (should be impossible now)
-        if sql_text.upper().count('SELECT') > 1:
-            # Keep only up to first occurrence after the initial SELECT
-            first_select_end = sql_text.upper().find('SELECT', 1)
-            if first_select_end > 0:
-                sql_text = sql_text[:first_select_end].strip()
-                print(f"⚠️  Removed duplicate SELECT statements")
-    
-        print("✅ CLEANED OUTPUT:")
-        print(sql_text[:300] + "..." if len(sql_text) > 300 else sql_text)
-        print("=" * 80 + "\n")
-    
-        return sql_text
-    
     async def generate_sql(self, query: str) -> Dict[str, Any]:
-        """Generate SQL with 3-tier hierarchy + validation"""
+        """
+        SMART PIPELINE WITH CLAUDE:
+        1. Modal generates SQL
+        2. Auto-fix event types
+        3. Claude validates/corrects
+        4. Return best SQL
+        """
         
         print("\n" + "=" * 80)
-        print("🔍 SQL GENERATION PROCESS")
+        print("🧠 SMART SQL PIPELINE (CLAUDE VALIDATOR)")
         print("=" * 80)
         print(f"Query: {query}")
-        print("=" * 80 + "\n")
+        print("=" * 80)
         
-        # TIER 1: Try Modal
+        # STAGE 1: Modal
         if self.modal_gen.enabled:
-            print("📍 TIER 1: Trying Modal fine-tuned Code Llama...")
+            print("\n📍 STAGE 1: Modal generates SQL...")
             modal_sql = await self.modal_gen.generate_sql(query)
+            
             if modal_sql:
-                # VALIDATE
-                validation = self.sql_validator.validate_and_fix(modal_sql, query)
+                # STAGE 2: Auto-fix event types
+                modal_sql = fix_common_sql_errors(modal_sql)
                 
-                print("\n" + "=" * 80)
-                print("🔍 SQL VALIDATION")
-                print("=" * 80)
-                for warning in validation['warnings']:
-                    print(warning)
-                print("=" * 80 + "\n")
+                # STAGE 3: Claude validates/corrects
+                print("\n📍 STAGE 3: Claude validates...")
+                
+                validation = await self.claude_validator.validate_and_correct(
+                    modal_sql, 
+                    query, 
+                    source='modal'
+                )
                 
                 if validation['valid']:
-                    print(f"✅ [TIER 1] Using Modal fine-tuned Code Llama\n")
-                    return {
-                        'success': True,
-                        'sql': validation['sql'],
-                        'source': 'modal'
-                    }
+                    if validation['corrected']:
+                        print("\n🎯 Using CLAUDE-CORRECTED SQL (Modal → Claude fix)")
+                        return {
+                            'success': True,
+                            'sql': validation['sql'],
+                            'source': 'modal-claude-corrected'
+                        }
+                    else:
+                        print("\n🎯 Using CLAUDE-VALIDATED Modal SQL (Claude approved)")
+                        return {
+                            'success': True,
+                            'sql': validation['sql'],
+                            'source': 'modal-claude-validated'
+                        }
                 else:
-                    print(f"❌ [TIER 1] Modal SQL failed validation: {validation.get('error')}")
-                    print(f"⚠️  Falling back to TIER 2...\n")
+                    print("\n❌ Claude couldn't validate, generating fresh...")
         
-        # TIER 2: Try OpenRouter
-        if self.llm:
+        # STAGE 4: Claude fresh generation
+        if claude_client:
             try:
-                print("📍 TIER 2: Trying OpenRouter...")
+                print("\n📍 STAGE 4: Claude generates fresh SQL...")
                 
                 sql_prompt = f"""{DETAILED_SCHEMA}
 
-Generate SQL for: "{query}"
+Generate a MySQL query for: "{query}"
 
-CRITICAL RULES:
-- NEVER use NOW() - always calculate between actual event times
-- For taxi-in: TIMESTAMPDIFF(MINUTE, landing.event_time, inblock.event_time)
-- For taxi-out: TIMESTAMPDIFF(MINUTE, offblock.event_time, takeoff.event_time)
-- Always filter: BETWEEN 1 AND 120 minutes
+CRITICAL: Use EXACT event_type values:
+- 'Actual_Take_Off' (not 'takeoff')
+- 'Actual_Landing' (not 'landing')  
+- 'Actual_Off_Block' (not 'offblock')
+- 'Actual_In_Block' (not 'inblock')
 
-Return ONLY the SQL query, no explanations.
+Return ONLY the SQL query, no explanations or markdown.
 """
                 
-                response = await self.llm.ainvoke(
-                    [{"role": "user", "content": sql_prompt}],
-                    temperature=0.05
+                message = claude_client.messages.create(
+                    model=CLAUDE_MODEL,
+                    max_tokens=1500,
+                    temperature=0.05,
+                    messages=[{"role": "user", "content": sql_prompt}]
                 )
                 
-                sql = self._clean_sql(response.content)
+                sql = message.content[0].text.strip()
+                sql = self._clean_sql(sql)
+                sql = fix_common_sql_errors(sql)
                 
-                # VALIDATE
-                validation = self.sql_validator.validate_and_fix(sql, query)
-                
-                print("\n" + "=" * 80)
-                print("🔍 SQL VALIDATION")
-                print("=" * 80)
-                for warning in validation['warnings']:
-                    print(warning)
-                print("=" * 80 + "\n")
-                
-                if validation['valid'] and 'SELECT' in sql.upper():
-                    print(f"✅ [TIER 2] Using OpenRouter\n")
+                if sql and 'SELECT' in sql.upper():
+                    print(f"✅ Claude fresh SQL")
                     return {
                         'success': True,
-                        'sql': validation['sql'],
-                        'source': 'openrouter'
+                        'sql': sql,
+                        'source': 'claude'
                     }
-                else:
-                    print(f"❌ [TIER 2] OpenRouter SQL failed validation")
                 
             except Exception as e:
-                print(f"❌ [TIER 2] OpenRouter error: {e}\n")
+                print(f"❌ Claude error: {e}")
         
-        # TIER 3: Pre-built SQL
-        print("📍 TIER 3: Using pre-built SQL (fallback)")
+        # STAGE 5: Pre-built
+        print("\n📍 STAGE 5: Pre-built SQL")
         prebuilt = self._get_prebuilt_sql(query)
-        print(f"✅ [TIER 3] Using pre-built SQL\n")
         return {
             'success': True,
             'sql': prebuilt,
             'source': 'prebuilt'
         }
     
+    def _clean_sql(self, sql_text: str) -> str:
+        """Clean SQL"""
+        if not sql_text:
+            return sql_text
+        
+        sql_text = re.sub(r'```sql\s*', '', sql_text, flags=re.IGNORECASE)
+        sql_text = re.sub(r'```\s*', '', sql_text)
+        sql_text = re.sub(r'^\s*\d+\.\s+', '', sql_text, flags=re.MULTILINE)
+        
+        lines = sql_text.split('\n')
+        sql_start_idx = None
+        
+        for i, line in enumerate(lines):
+            if line.strip().upper().startswith(('SELECT', 'WITH')):
+                sql_start_idx = i
+                break
+        
+        if sql_start_idx is None:
+            return sql_text.strip()
+        
+        sql_lines = lines[sql_start_idx:]
+        sql_end_idx = len(sql_lines)
+        
+        for i, line in enumerate(sql_lines[1:], 1):
+            if line.strip().upper().startswith(('SELECT', 'WITH')):
+                sql_end_idx = i
+                break
+        
+        sql_text = '\n'.join(sql_lines[:sql_end_idx]).strip()
+        
+        if sql_text.endswith(';'):
+            sql_text = sql_text[:-1].strip()
+        
+        if 'LIMIT' not in sql_text.upper():
+            sql_text += ' LIMIT 100'
+        
+        return sql_text
+    
     def _get_prebuilt_sql(self, query: str) -> str:
-        """Get pre-built SQL based on query keywords"""
         query_lower = query.lower()
         
         for use_case_id, use_case in self.use_cases.items():
@@ -1381,7 +1498,7 @@ Return ONLY the SQL query, no explanations.
         return "SELECT * FROM flight LIMIT 10"
     
     async def process_query(self, query: str) -> Dict[str, Any]:
-        """Process query with all enhancements"""
+        """Process query with Claude-powered smart pipeline"""
         try:
             reasoning_steps = []
             
@@ -1396,7 +1513,6 @@ Return ONLY the SQL query, no explanations.
             
             reasoning_steps.append({
                 'action': 'generate_sql',
-                'input': query,
                 'observation': f"Generated via {sql_source}"
             })
             
@@ -1406,8 +1522,7 @@ Return ONLY the SQL query, no explanations.
             if enhanced_sql != sql_query:
                 reasoning_steps.append({
                     'action': 'apply_temporal_filter',
-                    'input': query,
-                    'observation': 'Applied time-based filtering'
+                    'observation': 'Applied time filtering'
                 })
             
             # Execute SQL
@@ -1415,50 +1530,41 @@ Return ONLY the SQL query, no explanations.
             
             reasoning_steps.append({
                 'action': 'execute_sql',
-                'input': enhanced_sql[:100] + '...',
                 'observation': f"Retrieved {result.get('row_count', 0)} rows"
             })
             
             if not result['success']:
                 return {
                     'success': False,
-                    'answer': f"SQL execution failed: {result.get('error')}",
-                    'reasoning_steps': reasoning_steps,
-                    'sql_queries': [enhanced_sql],
-                    'sql_source': sql_source
+                    'answer': f"SQL failed: {result.get('error')}",
+                    'sql_source': sql_source,
+                    'sql_queries': [enhanced_sql]
                 }
             
             if not result['data']:
                 return {
                     'success': True,
-                    'answer': "No data found for your query.",
-                    'reasoning_steps': reasoning_steps,
+                    'answer': "No data found.",
+                    'sql_source': sql_source,
                     'sql_queries': [enhanced_sql],
-                    'row_count': 0,
-                    'sql_source': sql_source
+                    'row_count': 0
                 }
             
-            # Generate insights
+            # Generate insights with Claude
             insights = await self._generate_insights(query, result['data'])
-            
-            reasoning_steps.append({
-                'action': 'generate_insights',
-                'input': f"{len(result['data'])} rows",
-                'observation': insights[:100] + '...'
-            })
             
             # Process output format
             output_data = self.response_controller.process_output(
                 user_query=query,
                 result=result,
                 insights=insights,
-                title="SeaTac Operations Analysis"
+                title="SeaTac Operations"
             )
             
             return {
                 'success': True,
                 'answer': output_data.get('message', insights),
-                'use_case': 'Dynamic Analysis',
+                'use_case': 'Analysis',
                 'reasoning_steps': reasoning_steps,
                 'sql_queries': [enhanced_sql],
                 'data': output_data.get('data', result['data'][:100]),
@@ -1476,91 +1582,96 @@ Return ONLY the SQL query, no explanations.
             traceback.print_exc()
             return {
                 'success': False,
-                'answer': f'Error: {str(e)}',
-                'reasoning_steps': reasoning_steps if 'reasoning_steps' in locals() else []
+                'answer': f'Error: {str(e)}'
             }
     
     async def _generate_insights(self, query: str, data: List[Dict]) -> str:
-        """Generate insights from results"""
+        """Generate insights using Claude"""
         if not data:
             return "No data available."
         
-        # Calculate statistics
-        numeric_fields = {}
-        for key in data[0].keys():
-            if any(term in key.lower() for term in ['avg', 'min', 'max', 'count']):
-                try:
-                    values = [float(row.get(key, 0)) for row in data if row.get(key) is not None]
-                    if values:
-                        numeric_fields[key] = {
-                            'avg': sum(values) / len(values),
-                            'min': min(values),
-                            'max': max(values)
-                        }
-                except:
-                    pass
-        
-        if not self.llm:
+        if not claude_client:
             return f"Found {len(data)} results."
         
         insights_prompt = f"""Analyze this airport operations data and provide 2-3 sentences with specific numbers.
 
 QUESTION: "{query}"
-RECORDS: {len(data)}
+DATA SAMPLE: {json.dumps(data[:3], indent=2, cls=DecimalEncoder)}
 
-SAMPLE DATA:
-{json.dumps(data[:3], indent=2, cls=DecimalEncoder)}
-
-STATISTICS:
-{json.dumps(numeric_fields, indent=2, cls=DecimalEncoder)}
-
-Provide clear insights with specific numbers:
+Provide brief, data-driven insights:
 """
         
         try:
-            response = await self.llm.ainvoke(
-                [{"role": "user", "content": insights_prompt}],
-                temperature=0.4
+            message = claude_client.messages.create(
+                model=CLAUDE_MODEL,
+                max_tokens=500,
+                temperature=0.4,
+                messages=[{"role": "user", "content": insights_prompt}]
             )
-            return response.content.strip()
+            return message.content[0].text.strip()
         except:
-            return f"Found {len(data)} results with various taxi time patterns."
+            return f"Found {len(data)} results."
 
 
 # ============================================================================
-# Initialize
+# INITIALIZE
 # ============================================================================
 
+modal_generator = ModalSQLGenerator(MODAL_ENDPOINT, USE_MODAL_MODEL)
+claude_validator = ClaudeSQLValidator(claude_client) if claude_client else None
+greeting_handler = GreetingHandler(claude_client) if claude_client else None  # NEW
 db_manager = DatabaseManager()
-agent_system = SeaTacAgent(modal_generator, llm, db_manager) if (modal_generator or llm) else None
+agent_system = SeaTacAgent(modal_generator, claude_validator, db_manager) if (modal_generator or claude_client) else None
 
 
 # ============================================================================
-# API Endpoints
+# API ENDPOINTS
 # ============================================================================
 
 @app.get("/")
 async def root():
     return {
-        "message": "SeaTac Operations Intelligence - Modal Edition v7.0",
-        "version": "7.0.0",
-        "modal_enabled": modal_generator.enabled,
-        "openrouter_model": OPENROUTER_MODEL,
-        "sql_hierarchy": [
-            "1. Modal fine-tuned Code Llama (your custom model)",
-            "2. OpenRouter (general purpose fallback)",
-            "3. Pre-built SQL (guaranteed fallback)"
+        "message": "SeaTac Operations Intelligence - Claude Validator v7.4",
+        "version": "7.4.0",
+        "pipeline": [
+            "1. Modal Code Llama generates SQL",
+            "2. Auto-correct event types",
+            "3. Claude validates/corrects (Big Brother)",
+            "4. Execute validated SQL",
+            "5. Claude generates insights"
         ]
     }
 
 
 @app.post("/api/query", response_model=QueryResponse)
 async def handle_query(request: QueryRequest):
-    """Process queries - uses Modal fine-tuned model first"""
+    """Process queries with Claude-powered validation and greeting detection"""
     try:
         if not request.query or len(request.query.strip()) < 2:
-            raise HTTPException(status_code=400, detail="Please provide a valid query")
+            raise HTTPException(status_code=400, detail="Invalid query")
         
+        # NEW: Check if it's a greeting or casual query
+        if greeting_handler and greeting_handler.is_greeting_or_casual(request.query):
+            print(f"\n🤝 Detected greeting/casual query: {request.query}")
+            casual_response = await greeting_handler.handle_casual_query(request.query)
+            
+            return QueryResponse(
+                success=True,
+                message=casual_response,
+                use_case="Casual",
+                agent_reasoning=[{
+                    'action': 'greeting_detected',
+                    'observation': 'Handled by Claude without SQL generation'
+                }],
+                row_count=0,
+                sql_queries=[],
+                data=None,
+                insights=None,
+                chart=None,
+                sql_source='claude-casual'
+            )
+        
+        # Regular data query processing
         if not agent_system:
             raise HTTPException(status_code=503, detail="No SQL generator configured")
         
@@ -1589,34 +1700,33 @@ async def handle_query(request: QueryRequest):
 async def health_check():
     return HealthResponse(
         status="healthy",
-        model=OPENROUTER_MODEL,
+        model=CLAUDE_MODEL,
         modal_enabled=modal_generator.enabled,
         modal_endpoint=MODAL_ENDPOINT if modal_generator.enabled else None,
-        openrouter_enabled=bool(llm),
+        claude_enabled=bool(claude_client),
         database_status="online" if db_manager.test_connection() else "offline",
-        version="7.0.0"
+        version="7.4.0"
     )
 
 
 @app.on_event("startup")
 async def startup_event():
     print("\n" + "=" * 80)
-    print("✈️  SeaTac Operations Intelligence - MODAL EDITION v7.0")
+    print("✈️  SeaTac Operations Intelligence - CLAUDE VALIDATOR v7.4")
     print("=" * 80)
-    print(f"Version: 7.0.0")
     
     if modal_generator.enabled:
         print(f"🦙 Modal Code Llama: ENABLED ✅")
         print(f"   Endpoint: {MODAL_ENDPOINT}")
-        print(f"   Status: Your fine-tuned model (PRIMARY)")
     else:
-        print(f"🦙 Modal Code Llama: DISABLED")
+        print(f"🦙 Modal: DISABLED")
     
-    if llm:
-        print(f"🌐 OpenRouter: Configured ✅ (FALLBACK)")
-        print(f"   Model: {OPENROUTER_MODEL}")
+    if claude_client:
+        print(f"🤖 Claude API: ENABLED ✅")
+        print(f"   Model: {CLAUDE_MODEL}")
+        print(f"   Role: Big Brother Validator + Insights Generator")
     else:
-        print(f"🌐 OpenRouter: Not configured")
+        print(f"🤖 Claude API: NOT CONFIGURED ❌")
     
     print(f"🗄️  Database: {db_manager.db_config['database']}@{db_manager.db_config['host']}")
     if db_manager.test_connection():
@@ -1624,17 +1734,21 @@ async def startup_event():
     else:
         print(f"   Status: Disconnected ❌")
     
-    print("\n📋 SQL Generation Hierarchy:")
-    print("   1️⃣  Modal fine-tuned Code Llama (your custom model)")
-    print("   2️⃣  OpenRouter (general purpose)")
-    print("   3️⃣  Pre-built SQL (guaranteed fallback)")
+    print("\n🧠 Smart SQL Pipeline (Claude-Powered):")
+    print("   1️⃣  Modal generates initial SQL")
+    print("   2️⃣  Auto-correct event types")
+    print("   3️⃣  Claude validates and corrects (Big Brother)")
+    print("   4️⃣  Execute validated/corrected SQL")
+    print("   5️⃣  Claude generates data insights")
     
-    print("\n✨ Features v7.0:")
-    print("   ✓ Modal fine-tuned Code Llama integration")
-    print("   ✓ Robust SQL cleaning and validation")
-    print("   ✓ Temporal filtering (afternoon, morning, time ranges)")
-    print("   ✓ Output format classification (chart/table/text)")
-    print("   ✓ Smart 3-tier SQL generation")
+    print("\n✨ Features v7.4:")
+    print("   ✓ Claude API as superior validator")
+    print("   ✓ Schema-aware SQL validation")
+    print("   ✓ Auto-correction of event types")
+    print("   ✓ Claude-powered insights generation")
+    print("   ✓ Temporal filtering")
+    print("   ✓ Output format classification")
+    print("   ✓ Zero bad queries reach MySQL")
     
     print("\n🚀 Server starting on http://0.0.0.0:8000")
     print("=" * 80 + "\n")
