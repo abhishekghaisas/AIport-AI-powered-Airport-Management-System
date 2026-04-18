@@ -32,8 +32,8 @@ ChatGPT-like desktop interface using Google Gemini API for NLP-to-SQL conversion
 |-------|------------|
 | Desktop App | Electron |
 | Frontend | React 18 + TypeScript + Vite |
-| Backend | Flask + Python 3.8+ |
-| AI/NLP | Google Gemini API (gemini-2.5-pro) |
+| Backend | FastAPI + Python 3.8+ |
+| AI/NLP | CodeLlama-7B + Claude 4.5 Haiku validation |
 | Database | MySQL 8.0 |
 | UI Components | shadcn/ui + Tailwind CSS |
 
