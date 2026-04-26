@@ -21,7 +21,7 @@ ChatGPT-like desktop interface using Google Gemini API for NLP-to-SQL conversion
 
 | Metric | Result | Target |
 |--------|--------|--------|
-| Query Accuracy | 78% | 80% |
+| Query Accuracy | 91% | 80% ✓ |
 | Response Time | <45 sec | <120 sec ✓ |
 | Time Reduction | 99.8% | — |
 | Supported Query Types | 11 | 10+ ✓ |
@@ -49,7 +49,8 @@ mysql -u root -p < database/data/AIplane.sql
 # 3. Configure backend
 cd backend
 cp .env.example .env
-# Edit .env: add GEMINI_API_KEY and DATABASE_PASSWORD
+# Edit .env: add CLAUDE_API_KEY and DATABASE_PASSWORD
+       .env: add MODAL_API_KEY for fine-tuned LLM
 
 # 4. Install dependencies
 pip install -r requirements.txt
@@ -141,11 +142,10 @@ The system supports 11 core query types:
 
 | Name | Role |
 |------|------|
-| Aurora Ouyang | Tech Lead |
-| Anqi Yu | Developer |
-| Dora Ren | Developer |
-| Yuwei Ma | Developer |
-| Xiaoya Wang | Developer |
+| Abhishek Ghaisas | AI/ML Lead |
+| Nishant Kumar | Project Manager |
+| Ishan Chaudhary | Backend and Data Lead |
+| Zhiqi Zhang | Frontend and Data Lead |
 
 ## Acknowledgments
 
