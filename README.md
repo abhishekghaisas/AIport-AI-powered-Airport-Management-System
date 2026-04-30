@@ -37,6 +37,13 @@ ChatGPT-like desktop interface using Google Gemini API for NLP-to-SQL conversion
 | Database | MySQL 8.0 |
 | UI Components | shadcn/ui + Tailwind CSS |
 
+## Screenshot
+
+Sample Query and Response
+
+<img width="1470" height="956" alt="Screenshot 2026-03-17 at 8 53 05 PM" src="https://github.com/user-attachments/assets/42c8e405-603d-4547-9b63-85a545a44a8c" />
+
+
 ## Quick Start
 
 ```bash
