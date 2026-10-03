@@ -1,11 +1,6 @@
 # AIport
 
 > AI-powered conversational interface for airport gate utilization analysis at Seattle-Tacoma International Airport
->
-> App Link: https://nam12.safelinks.protection.outlook.com/?url=https%3A%2F%2Fendearing-abundance-production-5a45.up.railway.app%2F&data=05%7C02%7Cghaisas.a%40northeastern.edu%7C9aa69bb3864e43280b8f08deaab7358d%7Ca8eec281aaa34daeac9b9a398b9215e7%7C0%7C0%7C639135901207507521%7CUnknown%7CTWFpbGZsb3d8eyJFbXB0eU1hcGkiOnRydWUsIlYiOiIwLjAuMDAwMCIsIlAiOiJXaW4zMiIsIkFOIjoiTWFpbCIsIldUIjoyfQ%3D%3D%7C0%7C%7C%7C&sdata=gV0GO941tjx0F6%2FuOto0JNdZ6hyuXQ0LBCs6KqSy5tQ%3D&reserved=0
->
-> Username: admin
-> Password: admin123
 
 ## Overview
 
@@ -28,7 +23,7 @@ ChatGPT-like desktop interface using Google Gemini API for NLP-to-SQL conversion
 |--------|--------|--------|
 | Query Accuracy | 91% | 80% ✓ |
 | Response Time | <45 sec | <120 sec ✓ |
-| Time Reduction | 99.8% | — |
+| Time Reduction | 72.8% | — |
 | Supported Query Types | 11 | 10+ ✓ |
 
 ## Tech Stack
@@ -86,7 +81,7 @@ AIport/
 ├── electron/
 │   └── main.js              # Electron main process
 ├── backend/
-│   ├── app.py               # Flask API server
+│   ├── app.py               # FastAPI server
 │   ├── requirements.txt     # Python dependencies
 │   └── .env.example         # Environment template
 ├── frontend/
@@ -162,7 +157,7 @@ The system supports 11 core query types:
 ## Acknowledgments
 
 - **Port of Seattle** — Project sponsor and data provider
-- **Northeastern University** — Capstone program
+- **Northeastern University** — Experiential Expo program
 
 ## License
 
